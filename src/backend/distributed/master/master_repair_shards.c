@@ -45,7 +45,12 @@ static void RepairShardPlacement(int64 shardId, char *sourceNodeName,
 static void EnsureShardCanBeRepaired(int64 shardId, char *sourceNodeName,
 									 int32 sourceNodePort, char *targetNodeName,
 									 int32 targetNodePort);
-static char * ConstructQualifiedShardName(ShardInterval *shardInterval);
+static ShardPlacement * SearchShardPlacementInList(List *shardPlacementList,
+												   char *nodeName, uint32 nodePort,
+												   bool missingOk);
+static List * CopyShardCommandList(ShardInterval *shardInterval, char *sourceNodeName,
+								   int32 sourceNodePort);
+static List * CopyShardForeignConstraintCommandList(ShardInterval *shardInterval);
 static List * RecreateTableDDLCommandList(Oid relationId);
 
 /* declarations for dynamic loading */
@@ -353,7 +358,7 @@ CopyShardForeignConstraintCommandList(ShardInterval *shardInterval)
  *
  * FIXME: Copied from Citus-MX, should be removed once those changes checked-in to Citus.
  */
-static char *
+char *
 ConstructQualifiedShardName(ShardInterval *shardInterval)
 {
 	Oid schemaId = get_rel_namespace(shardInterval->relationId);

@@ -26,16 +26,22 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/commit_protocol.h"
 #include "distributed/connection_cache.h"
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_shard_transaction.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
+#include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/worker_manager.h"
+#include "distributed/worker_transaction.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
@@ -51,11 +57,31 @@
 
 
 /* local function forward declarations */
+static uint64 SplitShardForTenant(ShardInterval *oldShardInterval,
+								  char *hashFunctionName, int hashedValue);
+static List * NodeConnectionInfoList(Oid shardId);
+static void CreateNewShards(List *nodeConnectionInfoList,
+							List *createNewShardCommandList);
+static void CreateNewMetadata(List *newShardIntervalList, List *nodeConnectionInfoList);
+static void DropOldShards(List *shardIntervalList, List *nodeConnectionInfoList);
+static List * NewShardIntervalList(ShardInterval *oldShardInterval, int hashedValue);
+static List * NewShardCommandList(List *oldShardIntervalList, List *newShardIntervalList,
+								  char *hashFunctionName);
+static char * NewShardCommand(ShardInterval *oldShardInterval,
+							  ShardInterval *newShardInterval,
+							  char *hashFunctionName);
 static text * IntegerToText(int32 value);
 
+typedef struct NodeConnectionInfo
+{
+	char *userName;
+	char *nodeName;
+	uint32 nodePort;
+} NodeConnectionInfo;
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(master_create_worker_shards);
+PG_FUNCTION_INFO_V1(isolate_tenant_to_new_shard);
 
 
 /*
@@ -76,6 +102,359 @@ master_create_worker_shards(PG_FUNCTION_ARGS)
 	CreateShardsWithRoundRobinPolicy(distributedTableId, shardCount, replicationFactor);
 
 	PG_RETURN_VOID();
+}
+
+
+Datum
+isolate_tenant_to_new_shard(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+	Datum tenantIdDatum = PG_GETARG_DATUM(1);
+
+	Oid tenantIdDataType = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	ShardInterval *shardInterval = NULL;
+	FmgrInfo *hashFunction = NULL;
+	int hashedValue = 0;
+	char *hashFunctionName = NULL;
+
+	DistTableCacheEntry *cacheEntry = NULL;
+	uint64 isolatedShardId = 0;
+
+	shardInterval = DistributionValueShardInterval(relationId, tenantIdDataType,
+												   tenantIdDatum);
+
+	cacheEntry = DistributedTableCacheEntry(relationId);
+	hashFunction = cacheEntry->hashFunction;
+	hashFunctionName = get_func_name(hashFunction->fn_oid);
+	hashedValue = DatumGetInt32(FunctionCall1(hashFunction, tenantIdDatum));
+
+	isolatedShardId = SplitShardForTenant(shardInterval, hashFunctionName, hashedValue);
+
+	PG_RETURN_INT64(isolatedShardId);
+}
+
+
+static uint64
+SplitShardForTenant(ShardInterval *oldShardInterval, char *hashFunctionName,
+					int hashedValue)
+{
+	/* XXX: is it safe to use directly hashed value */
+	int isolatedShardIndex = 0;
+	ShardInterval *isolatedShardInterval = NULL;
+	List *colocatedShardIntervalList = NIL;
+	List *newShardIntervalList = NIL;
+	List *newShardCommandList = NIL;
+	List *nodeConnectionInfoList = NIL;
+
+	colocatedShardIntervalList = ColocatedShardIntervalList(oldShardInterval);
+	newShardIntervalList = NewShardIntervalList(oldShardInterval, hashedValue);
+	newShardCommandList = NewShardCommandList(colocatedShardIntervalList,
+											  newShardIntervalList,
+											  hashFunctionName);
+
+	nodeConnectionInfoList = NodeConnectionInfoList(oldShardInterval->shardId);
+
+	/* create new shards in a seperate transaction */
+	CreateNewShards(nodeConnectionInfoList, newShardCommandList);
+
+	CreateNewMetadata(newShardIntervalList, nodeConnectionInfoList);
+
+	/* drop old shards and delete related metadata */
+	DropOldShards(colocatedShardIntervalList, nodeConnectionInfoList);
+
+	/* XXX: need to find the original table from colocated tables  */
+	isolatedShardInterval = list_nth(newShardIntervalList, isolatedShardIndex);
+
+	return isolatedShardInterval->shardId;
+}
+
+
+static List *
+NodeConnectionInfoList(Oid shardId)
+{
+	List *nodeConnectionInfoList = NIL;
+	List *shardPlacementList = FinalizedShardPlacementList(shardId);
+	ListCell *shardPlacementCell = NULL;
+	char *currentUserName = CurrentUserName();
+
+	foreach(shardPlacementCell, shardPlacementList)
+	{
+		ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+		NodeConnectionInfo *nodeConnectionInfo = palloc(sizeof(NodeConnectionInfo));
+
+		nodeConnectionInfo->userName = currentUserName;
+		nodeConnectionInfo->nodeName = placement->nodeName;
+		nodeConnectionInfo->nodePort = placement->nodePort;
+
+		nodeConnectionInfoList = lappend(nodeConnectionInfoList, nodeConnectionInfo);
+	}
+
+	return nodeConnectionInfoList;
+}
+
+
+static char *
+NewShardCommand(ShardInterval *oldShardInterval, ShardInterval *newShardInterval,
+				char *hashFunctionName)
+{
+	StringInfo newShardCommand = makeStringInfo();
+
+	char *oldShardName = ConstructQualifiedShardName(oldShardInterval);
+	char *newShardName = ConstructQualifiedShardName(newShardInterval);
+
+	Oid relationId = oldShardInterval->relationId;
+	Var *partitionKey = PartitionKey(relationId);
+	char *partitionColumnName = get_attname(relationId, partitionKey->varattno);
+
+	int32 shardMinValue = DatumGetInt32(newShardInterval->minValue);
+	int32 shardMaxValue = DatumGetInt32(newShardInterval->maxValue);
+
+	/* XXX: replace hashint8 with an udf of us to make it correctly work */
+	appendStringInfo(newShardCommand,
+					 "CREATE TABLE %s AS SELECT * FROM %s WHERE "
+					 "%s(%s) >= %d AND %s(%s) <= %d",
+					 newShardName, oldShardName,
+					 hashFunctionName, partitionColumnName, shardMinValue,
+					 hashFunctionName, partitionColumnName, shardMaxValue);
+
+	return newShardCommand->data;
+}
+
+
+static List *
+NewShardIntervalList(ShardInterval *oldShardInterval, int hashedValue)
+{
+	List *newShardIntervalList = NIL;
+	List *baseShardIntervalList = NIL;
+	List *colocatedShardIntervalList = NIL;
+	ListCell *shardIntervalCell = NULL;
+	ShardInterval *isolatedShardInterval = NULL;
+
+	/* get min and max values of the target shard */
+	int32 shardMinValue = DatumGetInt32(oldShardInterval->minValue);
+	int32 shardMaxValue = DatumGetInt32(oldShardInterval->maxValue);
+
+	/* add lower range if exists */
+	if (shardMinValue < hashedValue)
+	{
+		ShardInterval *lowerShardRange = CitusMakeNode(ShardInterval);
+		lowerShardRange->minValue = Int32GetDatum(shardMinValue);
+		lowerShardRange->maxValue = Int32GetDatum(hashedValue - 1);
+
+		baseShardIntervalList = lappend(baseShardIntervalList, lowerShardRange);
+	}
+
+	/* add isolated tenant */
+	isolatedShardInterval = CitusMakeNode(ShardInterval);
+	isolatedShardInterval->minValue = Int32GetDatum(hashedValue);
+	isolatedShardInterval->maxValue = Int32GetDatum(hashedValue);
+
+	baseShardIntervalList = lappend(baseShardIntervalList, isolatedShardInterval);
+
+	/* add upper range if exists */
+	if (shardMaxValue > hashedValue)
+	{
+		ShardInterval *upperShardRange = CitusMakeNode(ShardInterval);
+		upperShardRange->minValue = Int32GetDatum(hashedValue + 1);
+		upperShardRange->maxValue = Int32GetDatum(shardMaxValue);
+
+		baseShardIntervalList = lappend(baseShardIntervalList, upperShardRange);
+	}
+
+	if (list_length(baseShardIntervalList) == 1)
+	{
+		char *tableName = get_rel_name(oldShardInterval->relationId);
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("table \"%s\" has already isolated for the given "
+							   "value", tableName)));
+	}
+
+	colocatedShardIntervalList = ColocatedShardIntervalList(oldShardInterval);
+	foreach(shardIntervalCell, colocatedShardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		ListCell *baseShardIntervalCell = NULL;
+
+		foreach(baseShardIntervalCell, baseShardIntervalList)
+		{
+			ShardInterval *baseShardInterval =
+				(ShardInterval *) lfirst(baseShardIntervalCell);
+
+			ShardInterval *newShardInterval = CitusMakeNode(ShardInterval);
+			newShardInterval->minValue = baseShardInterval->minValue;
+			newShardInterval->maxValue = baseShardInterval->maxValue;
+			newShardInterval->relationId = shardInterval->relationId;
+			newShardInterval->shardId = GetNextShardId();
+			newShardInterval->storageType = shardInterval->storageType;
+
+			newShardIntervalList = lappend(newShardIntervalList, newShardInterval);
+		}
+	}
+
+	return newShardIntervalList;
+}
+
+
+static List *
+NewShardCommandList(List *oldShardIntervalList, List *newShardIntervalList,
+					char *hashFunctionName)
+{
+	List *newShardCommandList = NIL;
+	ListCell *shardIntervalCell = NULL;
+
+	foreach(shardIntervalCell, oldShardIntervalList)
+	{
+		ShardInterval *oldShardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		ListCell *newShardIntervalCell = NULL;
+
+		foreach(newShardIntervalCell, newShardIntervalList)
+		{
+			ShardInterval *newShardInterval = (ShardInterval *) lfirst(
+				newShardIntervalCell);
+
+			/* if shard intervals from the same relation */
+			if (oldShardInterval->relationId == newShardInterval->relationId)
+			{
+				char *newShardCommand = NULL;
+				newShardCommand = NewShardCommand(oldShardInterval, newShardInterval,
+												  hashFunctionName);
+
+				newShardCommandList = lappend(newShardCommandList, newShardCommand);
+			}
+		}
+	}
+
+	return newShardCommandList;
+}
+
+
+static void
+CreateNewShards(List *nodeConnectionInfoList, List *createNewShardCommandList)
+{
+	List *workerConnectionList = NIL;
+	ListCell *workerConnectionCell = NULL;
+	ListCell *nodeConnectionInfoCell = NULL;
+
+	/* send create tables */
+	foreach(nodeConnectionInfoCell, nodeConnectionInfoList)
+	{
+		NodeConnectionInfo *nodeConnectionInfo = (NodeConnectionInfo *) lfirst(
+			nodeConnectionInfoCell);
+		char *userName = nodeConnectionInfo->userName;
+		char *workerName = nodeConnectionInfo->nodeName;
+		uint32 workerPort = nodeConnectionInfo->nodePort;
+
+		MultiConnection *workerConnection = NULL;
+		ListCell *commandCell = NULL;
+		int connectionFlags = FORCE_NEW_CONNECTION;
+
+		if (XactModificationLevel > XACT_MODIFICATION_NONE)
+		{
+			ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+							errmsg(
+								"cannot open new connections after the first modification "
+								"command within a transaction")));
+		}
+
+		workerConnection = GetNodeUserDatabaseConnection(connectionFlags, workerName,
+														 workerPort,
+														 userName, NULL);
+
+		MarkRemoteTransactionCritical(workerConnection);
+		RemoteTransactionBegin(workerConnection);
+
+		/* iterate over the commands and execute them in the same connection */
+		foreach(commandCell, createNewShardCommandList)
+		{
+			char *commandString = lfirst(commandCell);
+			ExecuteCriticalRemoteCommand(workerConnection, commandString);
+		}
+
+		workerConnectionList = lappend(workerConnectionList, workerConnection);
+	}
+
+	/* commit transactions */
+	foreach(workerConnectionCell, workerConnectionList)
+	{
+		MultiConnection *workerConnection = (MultiConnection *) lfirst(
+			workerConnectionCell);
+
+		RemoteTransactionCommit(workerConnection);
+		CloseConnection(workerConnection);
+	}
+}
+
+
+static void
+CreateNewMetadata(List *newShardIntervalList, List *nodeConnectionInfoList)
+{
+	ListCell *shardIntervalCell = NULL;
+
+	/* add new metadata */
+	foreach(shardIntervalCell, newShardIntervalList)
+	{
+		ShardInterval *newShardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		Oid relationId = newShardInterval->relationId;
+		uint64 shardId = newShardInterval->shardId;
+		char storageType = newShardInterval->storageType;
+		ListCell *nodeConnectionInfoCell = NULL;
+
+		int32 shardMinValue = DatumGetInt32(newShardInterval->minValue);
+		int32 shardMaxValue = DatumGetInt32(newShardInterval->maxValue);
+		text *shardMinValueText = IntegerToText(shardMinValue);
+		text *shardMaxValueText = IntegerToText(shardMaxValue);
+
+		InsertShardRow(relationId, shardId, storageType, shardMinValueText,
+					   shardMaxValueText);
+
+		/* new shard placement metadata */
+		foreach(nodeConnectionInfoCell, nodeConnectionInfoList)
+		{
+			NodeConnectionInfo *nodeConnectionInfo =
+				(NodeConnectionInfo *) lfirst(nodeConnectionInfoCell);
+			char *workerName = nodeConnectionInfo->nodeName;
+			uint32 workerPort = nodeConnectionInfo->nodePort;
+			uint64 shardSize = 0;
+
+			InsertShardPlacementRow(shardId, INVALID_PLACEMENT_ID, FILE_FINALIZED,
+									shardSize, workerName, workerPort);
+		}
+	}
+}
+
+
+static void
+DropOldShards(List *shardIntervalList, List *nodeConnectionInfoList)
+{
+	ListCell *shardIntervalCell = NULL;
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		ListCell *nodeConnectionInfoCell = NULL;
+
+		uint64 oldShardId = shardInterval->shardId;
+		DeleteShardRow(oldShardId);
+
+		foreach(nodeConnectionInfoCell, nodeConnectionInfoList)
+		{
+			NodeConnectionInfo *nodeConnectionInfo =
+				(NodeConnectionInfo *) lfirst(nodeConnectionInfoCell);
+			char *qualifiedTableName = NULL;
+			StringInfo dropQuery = makeStringInfo();
+
+			/* delete old shard placement metadata */
+			char *workerName = nodeConnectionInfo->nodeName;
+			uint32 workerPort = nodeConnectionInfo->nodePort;
+			DeleteShardPlacementRow(oldShardId, workerName, workerPort);
+
+			/* drop old shard */
+			qualifiedTableName = ConstructQualifiedShardName(shardInterval);
+			appendStringInfo(dropQuery, DROP_REGULAR_TABLE_COMMAND, qualifiedTableName);
+
+			SendCommandToWorker(workerName, workerPort, dropQuery->data);
+		}
+	}
 }
 
 
