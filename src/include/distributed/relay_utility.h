@@ -18,6 +18,7 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
 
 
 /* Shard name and identifier related defines */
@@ -47,6 +48,8 @@ extern void RelayEventExtendNamesForInterShardCommands(Node *parseTree,
 													   char *leftShardSchemaName,
 													   uint64 rightShardId,
 													   char *rightShardSchemaName);
+extern AlterSeqStmt * AlterSequenceMinMaxValueCommand(char *schemaName,
+													  char *sequenceName);
 extern void AppendShardIdToName(char **name, uint64 shardId);
 
 #endif   /* RELAY_UTILITY_H */

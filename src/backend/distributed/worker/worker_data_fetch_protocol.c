@@ -75,6 +75,7 @@ PG_FUNCTION_INFO_V1(worker_fetch_partition_file);
 PG_FUNCTION_INFO_V1(worker_fetch_query_results_file);
 PG_FUNCTION_INFO_V1(worker_apply_shard_ddl_command);
 PG_FUNCTION_INFO_V1(worker_apply_inter_shard_ddl_command);
+PG_FUNCTION_INFO_V1(worker_apply_sequence_command);
 PG_FUNCTION_INFO_V1(worker_fetch_regular_table);
 PG_FUNCTION_INFO_V1(worker_fetch_foreign_file);
 PG_FUNCTION_INFO_V1(worker_append_table_to_shard);
@@ -444,6 +445,53 @@ worker_apply_inter_shard_ddl_command(PG_FUNCTION_ARGS)
 											   rightShardSchemaName);
 	ProcessUtility(ddlCommandNode, ddlCommand, PROCESS_UTILITY_TOPLEVEL, NULL,
 				   None_Receiver, NULL);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * worker_apply_sequence_command takes a CREATE SEQUENCE command string, runs the
+ * CREATE SEQUENCE command then creates and runs an ALTER SEQUENCE statement
+ * which adjusts the minvalue and maxvalue of the sequence such that the sequence
+ * creates globally unique values.
+ */
+Datum
+worker_apply_sequence_command(PG_FUNCTION_ARGS)
+{
+	text *commandText = PG_GETARG_TEXT_P(0);
+	const char *commandString = text_to_cstring(commandText);
+	const char *dummyString = "-";
+	Node *commandNode = ParseTreeNode(commandString);
+	CreateSeqStmt *createSequenceStatement = NULL;
+	AlterSeqStmt *alterSequenceStatement = NULL;
+	char *sequenceName = NULL;
+	char *sequenceSchema = NULL;
+
+	NodeTag nodeType = nodeTag(commandNode);
+	if (nodeType != T_CreateSeqStmt)
+	{
+		ereport(ERROR,
+				(errmsg("must call worker_apply_sequence_command with a CREATE"
+						" SEQUENCE command string")));
+	}
+
+	createSequenceStatement = (CreateSeqStmt *) commandNode;
+	sequenceName = createSequenceStatement->sequence->relname;
+	sequenceSchema = createSequenceStatement->sequence->schemaname;
+
+	/* run the CREATE SEQUENCE command */
+	ProcessUtility(commandNode, commandString, PROCESS_UTILITY_TOPLEVEL,
+				   NULL, None_Receiver, NULL);
+
+	/* create and run an ALTER SEQUENCE command to set the unique space of the sequence */
+	alterSequenceStatement = AlterSequenceMinMaxValueCommand(sequenceSchema,
+															 sequenceName);
+	SetSequenceStartAndMaxValue(alterSequenceStatement);
+
+	/* since the command is an AlterSeqStmt, a dummy command string works fine */
+	ProcessUtility((Node *) alterSequenceStatement, dummyString, PROCESS_UTILITY_TOPLEVEL,
+				   NULL, None_Receiver, NULL);
 
 	PG_RETURN_VOID();
 }

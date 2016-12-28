@@ -30,7 +30,7 @@ SELECT * FROM pg_dist_partition WHERE partmethod='h' AND repmodel='s';
 SELECT unnest(master_metadata_snapshot());
 
 -- Create a test table with constraints and SERIAL
-CREATE TABLE mx_test_table (col_1 int UNIQUE, col_2 text NOT NULL, col_3 SERIAL);
+CREATE TABLE mx_test_table (col_1 int UNIQUE, col_2 text NOT NULL, col_3 BIGSERIAL);
 SELECT master_create_distributed_table('mx_test_table', 'col_1', 'hash');
 SELECT master_create_worker_shards('mx_test_table', 8, 1);
 
@@ -380,10 +380,15 @@ SELECT logicalrelid, repmodel FROM pg_dist_partition WHERE logicalrelid = 'mx_te
 
 DROP TABLE mx_temp_drop_test;
 
--- Create an MX table with sequences
+-- Check that MX tables do not support SERIAL columns
 \c - - - :master_port	
 SET citus.shard_count TO 3;
 SET citus.shard_replication_factor TO 1;
+
+CREATE TABLE mx_table_with_small_sequence(a int, b SERIAL);
+SELECT create_distributed_table('mx_table_with_small_sequence', 'a');
+
+-- Create an MX table with (BIGSERIAL) sequences
 SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
 
 CREATE TABLE mx_table_with_sequence(a int, b BIGSERIAL, c BIGSERIAL);
@@ -392,11 +397,27 @@ SELECT create_distributed_table('mx_table_with_sequence', 'a');
 \ds mx_table_with_sequence_b_seq
 \ds mx_table_with_sequence_c_seq
 
--- Check that the sequences created on the worker as well
+-- Check that the sequences created on the metadata worker as well
 \c - - - :worker_1_port
 \d mx_table_with_sequence
 \ds mx_table_with_sequence_b_seq
 \ds mx_table_with_sequence_c_seq
+
+-- Check that the sequences on the worker have their own space
+SELECT nextval('mx_table_with_sequence_b_seq');
+SELECT nextval('mx_table_with_sequence_c_seq');
+
+-- Check that adding a new metadata node sets the sequence space correctly
+\c - - - :master_port
+SELECT start_metadata_sync_to_node('localhost', :worker_2_port);
+
+\c - - - :worker_2_port
+SELECT groupid FROM pg_dist_local_group;
+\d mx_table_with_sequence
+\ds mx_table_with_sequence_b_seq
+\ds mx_table_with_sequence_c_seq
+SELECT nextval('mx_table_with_sequence_b_seq');
+SELECT nextval('mx_table_with_sequence_c_seq');
 
 -- Check that dropping the mx table with sequences works as expected
 \c - - - :master_port

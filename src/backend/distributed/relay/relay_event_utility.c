@@ -28,9 +28,11 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_constraint.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/relay_utility.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
@@ -47,6 +49,7 @@
 #include "utils/relcache.h"
 
 /* Local functions forward declarations */
+static void SetDefElemArg(AlterSeqStmt *statement, const char *name, Node *arg);
 static void AppendShardIdToConstraintName(AlterTableCmd *command, uint64 shardId);
 static void SetSchemaNameIfNotExist(char **schemaName, char *newSchemaName);
 static bool UpdateWholeRowColumnReferencesWalker(Node *node, uint64 *shardId);
@@ -469,6 +472,80 @@ RelayEventExtendNamesForInterShardCommands(Node *parseTree, uint64 leftShardId,
 			break;
 		}
 	}
+}
+
+
+/*
+ * AlterSequenceMinMaxValueCommand constructs an ALTER SEQUENCe statmenet which sets
+ * the start, restart, minvalue and maxvalue of sequence with the given name and schema.
+ * The function provides the uniqueness by shifting the start of the sequence by
+ * GetLocalGroupId() << 48 + 1 and sets a maxvalue which stops it from passing out any values
+ * greater than: (GetLocalGroupID() + 1) << 48.
+ *
+ * This is to ensure every group of workers passes out values from a unique range,
+ * and therefore that all values generated for the sequence are globally unique.
+ */
+AlterSeqStmt *
+AlterSequenceMinMaxValueCommand(char *schemaName, char *sequenceName)
+{
+	StringInfo startNumericString = makeStringInfo();
+	StringInfo maxNumericString = makeStringInfo();
+	int64 startValue = 0;
+	int64 maxValue = 0;
+	Node *startFloatArg = NULL;
+	Node *maxFloatArg = NULL;
+	AlterSeqStmt *alterSequenceStatement = makeNode(AlterSeqStmt);
+
+	alterSequenceStatement->sequence = makeRangeVar(schemaName, sequenceName, -1);
+
+	/*
+	 * DefElem->arg can only hold literal ints up to int4, in order to represent
+	 * larger numbers we need to construct a float represented as a string.
+	 */
+	startValue = (((int64) GetLocalGroupId()) << 48) + 1;
+	appendStringInfo(startNumericString, "%lu", startValue);
+	startFloatArg = (Node *) makeFloat(startNumericString->data);
+
+	maxValue = startValue + ((int64) 1 << 48);
+	appendStringInfo(maxNumericString, "%lu", maxValue);
+	maxFloatArg = (Node *) makeFloat(maxNumericString->data);
+
+	SetDefElemArg(alterSequenceStatement, "start", startFloatArg);
+	SetDefElemArg(alterSequenceStatement, "restart", startFloatArg);
+	SetDefElemArg(alterSequenceStatement, "minvalue", startFloatArg);
+	SetDefElemArg(alterSequenceStatement, "maxvalue", maxFloatArg);
+
+	return alterSequenceStatement;
+}
+
+
+/*
+ * SetDefElemArg scans through all the DefElem's of a CreateSeqStmt and
+ * and sets the arg of the one with a defname of name to arg.
+ *
+ * If a DefElem with the given defname does not exist it is created and
+ * added to the CreateSeqStmt.
+ */
+static void
+SetDefElemArg(AlterSeqStmt *statement, const char *name, Node *arg)
+{
+	DefElem *defElem = NULL;
+	ListCell *optionCell = NULL;
+
+	foreach(optionCell, statement->options)
+	{
+		defElem = (DefElem *) lfirst(optionCell);
+
+		if (strcmp(defElem->defname, name) == 0)
+		{
+			pfree(defElem->arg);
+			defElem->arg = arg;
+			return;
+		}
+	}
+
+	defElem = makeDefElem((char *) name, arg);
+	statement->options = lappend(statement->options, defElem);
 }
 
 

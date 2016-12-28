@@ -20,10 +20,13 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_foreign_server.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/distribution_column.h"
 #include "distributed/master_metadata_utility.h"
@@ -40,11 +43,16 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/tqual.h"
 
 
 static char * LocalGroupIdUpdateCommand(uint32 groupId);
 static void MarkNodeHasMetadata(char *nodeName, int32 nodePort, bool hasMetadata);
+static List * SequenceDDLCommandsForTable(Oid relationId);
+static void EnsureSupportedSequenceColumnType(Oid sequenceOid);
+static Oid TypeOfColumn(Oid tableId, int16 columnId);
 static char * TruncateTriggerCreateCommand(Oid relationId);
+static char * SchemaOwner(Oid schemaId);
 
 
 PG_FUNCTION_INFO_V1(start_metadata_sync_to_node);
@@ -217,11 +225,14 @@ MetadataCreateCommands(void)
 			(DistTableCacheEntry *) lfirst(distributedTableCell);
 		Oid relationId = cacheEntry->relationId;
 
-		List *commandList = GetTableDDLEvents(relationId);
+		List *workerSequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
+		List *ddlCommandList = GetTableDDLEvents(relationId);
 		char *tableOwnerResetCommand = TableOwnerResetCommand(relationId);
 
 		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
-												  commandList);
+												  workerSequenceDDLCommands);
+		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
+												  ddlCommandList);
 		metadataSnapshotCommandList = lappend(metadataSnapshotCommandList,
 											  tableOwnerResetCommand);
 	}
@@ -288,12 +299,19 @@ GetDistributedTableDDLEvents(Oid relationId)
 	List *commandList = NIL;
 	List *foreignConstraintCommands = NIL;
 	List *shardMetadataInsertCommandList = NIL;
+	List *sequenceDDLCommands = NIL;
+	List *tableDDLCommands = NIL;
 	char *tableOwnerResetCommand = NULL;
 	char *metadataCommand = NULL;
 	char *truncateTriggerCreateCommand = NULL;
 
+	/* commands to create sequences */
+	sequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
+	commandList = list_concat(commandList, sequenceDDLCommands);
+
 	/* commands to create the table */
-	commandList = GetTableDDLEvents(relationId);
+	tableDDLCommands = GetTableDDLEvents(relationId);
+	commandList = list_concat(commandList, tableDDLCommands);
 
 	/* command to reset the table owner */
 	tableOwnerResetCommand = TableOwnerResetCommand(relationId);
@@ -689,6 +707,140 @@ MarkNodeHasMetadata(char *nodeName, int32 nodePort, bool hasMetadata)
 
 
 /*
+ * SequenceDDLCommandsForTable returns a list of commands which create sequences (and
+ * their schemas) to run on workers before creating the relation. The sequence creation
+ * commands are wrapped with a `worker_apply_sequence_command` call, which sets the
+ * sequence space uniquely for each worker.
+ */
+List *
+SequenceDDLCommandsForTable(Oid relationId)
+{
+	List *sequenceDDLList = NIL;
+	List *ownedSequences = getOwnedSequences(relationId);
+	ListCell *listCell;
+
+	foreach(listCell, ownedSequences)
+	{
+		Oid sequenceOid = (Oid) lfirst_oid(listCell);
+		char *sequenceDef = pg_get_sequencedef_string(sequenceOid);
+		StringInfo wrappedSequenceDef = makeStringInfo();
+		Oid schemaId = InvalidOid;
+		char *createSchemaCommand = NULL;
+
+		EnsureSupportedSequenceColumnType(sequenceOid);
+
+		/* create schema if needed */
+		schemaId = get_rel_namespace(sequenceOid);
+		createSchemaCommand = CreateSchemaDDLCommand(schemaId);
+		if (createSchemaCommand != NULL)
+		{
+			sequenceDDLList = lappend(sequenceDDLList, createSchemaCommand);
+		}
+
+		appendStringInfo(wrappedSequenceDef,
+						 WORKER_APPLY_SEQUENCE_COMMAND,
+						 sequenceDef);
+
+		sequenceDDLList = lappend(sequenceDDLList, wrappedSequenceDef->data);
+	}
+
+	return sequenceDDLList;
+}
+
+
+/*
+ * CreateSchemaDDLCommand returns a "CREATE SCHEMA..." SQL string for creating the given
+ * schema if not exists and with proper authorization.
+ */
+char *
+CreateSchemaDDLCommand(Oid schemaId)
+{
+	char *schemaName = get_namespace_name(schemaId);
+	StringInfo schemaNameDef = NULL;
+	char *ownerName = NULL;
+
+	if (strncmp(schemaName, "public", NAMEDATALEN) == 0)
+	{
+		return NULL;
+	}
+
+	schemaNameDef = makeStringInfo();
+	ownerName = SchemaOwner(schemaId);
+	appendStringInfo(schemaNameDef, CREATE_SCHEMA_COMMAND, schemaName, ownerName);
+
+	return schemaNameDef->data;
+}
+
+
+/*
+ * EnsureSupportedSequenceColumnType looks at the column which depends on this sequence
+ * (which it Assert's exists) and makes sure its type is suitable for use in a disributed
+ * manner.
+ *
+ * Any column which depends on a sequence (and will therefore be replicated) but which is
+ * not a BIGINT cannot be used for an mx table, because there aren't enough values to
+ * ensure that generated numbers are globally unique.
+ */
+static void
+EnsureSupportedSequenceColumnType(Oid sequenceOid)
+{
+	Oid tableId = InvalidOid;
+	Oid columnType = InvalidOid;
+	int32 columnId = 0;
+	bool shouldSyncMetadata = false;
+
+	shouldSyncMetadata = ShouldSyncTableMetadata(tableId);
+
+	columnType = TypeOfColumn(tableId, (int16) columnId);
+
+	if (columnType != INT8OID && shouldSyncMetadata)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create clustered table with columns "
+							   "which use sequences, but are not BIGINT")));
+	}
+}
+
+
+/*
+ * TypeOfColumn returns the Oid of the type of the provided column of the provided table.
+ */
+static Oid
+TypeOfColumn(Oid tableId, int16 columnId)
+{
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	Oid returnType;
+	HeapTuple tup;
+	Form_pg_attribute attrForm;
+
+	Relation pgAttribute = heap_open(AttributeRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_attribute_attrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tableId));
+	ScanKeyInit(&key[1],
+				Anum_pg_attribute_attnum,
+				BTEqualStrategyNumber, F_OIDEQ,
+				UInt16GetDatum(columnId));
+
+	scan = systable_beginscan(pgAttribute, AttributeRelidNumIndexId, true,
+							  NULL, 2, key);
+
+	Assert(HeapTupleIsValid((tup = systable_getnext(scan))));
+
+	attrForm = (Form_pg_attribute) GETSTRUCT(tup);
+	returnType = attrForm->atttypid;
+
+	systable_endscan(scan);
+	heap_close(pgAttribute, AccessShareLock);
+
+	return returnType;
+}
+
+
+/*
  * TruncateTriggerCreateCommand creates a SQL query calling worker_create_truncate_trigger
  * function, which creates the truncate trigger on the worker.
  */
@@ -703,4 +855,48 @@ TruncateTriggerCreateCommand(Oid relationId)
 					 quote_literal_cstr(tableName));
 
 	return triggerCreateCommand->data;
+}
+
+
+/*
+ * SchemaOwner returns the name of the owner of the specified schema.
+ */
+static char *
+SchemaOwner(Oid schemaId)
+{
+	const int scanKeyCount = 1;
+
+	Relation namespaceRelation = heap_open(NamespaceRelationId, AccessShareLock);
+	ScanKeyData scanKeyData[scanKeyCount];
+	SysScanDesc scanDescriptor = NULL;
+	HeapTuple tuple = NULL;
+	char *ownerName = NULL;
+
+	/* start scan */
+	ScanKeyInit(&scanKeyData[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(schemaId));
+
+	scanDescriptor = systable_beginscan(namespaceRelation, NamespaceOidIndexId, true,
+										SnapshotSelf, 1, &scanKeyData[0]);
+	tuple = systable_getnext(scanDescriptor);
+
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_namespace nsptup = (Form_pg_namespace) GETSTRUCT(tuple);
+		Oid ownerId = nsptup->nspowner;
+
+		ownerName = GetUserNameFromId(ownerId, false);
+	}
+	else
+	{
+		/* if the schema is not found, then return the name of current user */
+		ownerName = GetUserNameFromId(GetUserId(), false);
+	}
+
+	systable_endscan(scanDescriptor);
+	heap_close(namespaceRelation, NoLock);
+
+	return ownerName;
 }
