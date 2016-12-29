@@ -162,6 +162,8 @@ SplitShardForTenant(ShardInterval *oldShardInterval, char *hashFunctionName,
 	/* drop old shards and delete related metadata */
 	DropOldShards(colocatedShardIntervalList, nodeConnectionInfoList);
 
+	CitusInvalidateRelcacheByRelid(DistShardRelationId());
+
 	/* XXX: need to find the original table from colocated tables  */
 	isolatedShardInterval = list_nth(newShardIntervalList, isolatedShardIndex);
 
@@ -300,17 +302,17 @@ NewShardCommandList(List *oldShardIntervalList, List *newShardIntervalList,
 					char *hashFunctionName)
 {
 	List *newShardCommandList = NIL;
-	ListCell *shardIntervalCell = NULL;
+	ListCell *oldShardIntervalCell = NULL;
 
-	foreach(shardIntervalCell, oldShardIntervalList)
+	foreach(oldShardIntervalCell, oldShardIntervalList)
 	{
-		ShardInterval *oldShardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		ShardInterval *oldShardInterval = (ShardInterval *) lfirst(oldShardIntervalCell);
 		ListCell *newShardIntervalCell = NULL;
 
 		foreach(newShardIntervalCell, newShardIntervalList)
 		{
-			ShardInterval *newShardInterval = (ShardInterval *) lfirst(
-				newShardIntervalCell);
+			ShardInterval *newShardInterval =
+				(ShardInterval *) lfirst(newShardIntervalCell);
 
 			/* if shard intervals from the same relation */
 			if (oldShardInterval->relationId == newShardInterval->relationId)
@@ -432,6 +434,7 @@ DropOldShards(List *shardIntervalList, List *nodeConnectionInfoList)
 	{
 		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		ListCell *nodeConnectionInfoCell = NULL;
+		Oid relationId = shardInterval->relationId;
 
 		uint64 oldShardId = shardInterval->shardId;
 		DeleteShardRow(oldShardId);
@@ -454,6 +457,10 @@ DropOldShards(List *shardIntervalList, List *nodeConnectionInfoList)
 
 			SendCommandToWorker(workerName, workerPort, dropQuery->data);
 		}
+
+		/* XXX: most likely not the best palce to invalidate the cache */
+		CitusInvalidateRelcacheByRelid(relationId);
+		CommandCounterIncrement();
 	}
 }
 
