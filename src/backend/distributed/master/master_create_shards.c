@@ -33,6 +33,7 @@
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_shard_transaction.h"
 #include "distributed/pg_dist_partition.h"
@@ -420,6 +421,24 @@ CreateNewMetadata(List *newShardIntervalList, List *nodeConnectionInfoList)
 
 			InsertShardPlacementRow(shardId, INVALID_PLACEMENT_ID, FILE_FINALIZED,
 									shardSize, workerName, workerPort);
+		}
+
+		CitusInvalidateRelcacheByRelid(relationId);
+		CommandCounterIncrement();
+
+		if (ShouldSyncTableMetadata(relationId))
+		{
+			List *shardMetadataInsertCommandList = NIL;
+			ListCell *commandCell = NULL;
+
+			/* send the commands one by one */
+			shardMetadataInsertCommandList = ShardListInsertCommand(list_make1(
+																		newShardInterval));
+			foreach(commandCell, shardMetadataInsertCommandList)
+			{
+				char *command = (char *) lfirst(commandCell);
+				SendCommandToWorkers(WORKERS_WITH_METADATA, command);
+			}
 		}
 	}
 }
