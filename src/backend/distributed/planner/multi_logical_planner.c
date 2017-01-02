@@ -58,7 +58,7 @@ static RuleApplyFunction RuleApplyFunctionArray[JOIN_RULE_LAST] = { 0 }; /* join
 static MultiNode * MultiPlanTree(Query *queryTree);
 static void ErrorIfQueryNotSupported(Query *queryTree);
 static bool HasUnsupportedJoinWalker(Node *node, void *context);
-static bool ErrorHintRequired(char *errorHint, Query *queryTree);
+static bool ErrorHintRequired(const char *errorHint, Query *queryTree);
 static void ErrorIfSubqueryNotSupported(Query *subqueryTree);
 static bool HasTablesample(Query *queryTree);
 static bool HasOuterJoin(Query *queryTree);
@@ -370,10 +370,11 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	bool hasComplexJoinOrder = false;
 	bool hasComplexRangeTableType = false;
 	bool preconditionsSatisfied = true;
-	char *errorHint = NULL;
-	char *joinHint = "Consider joining tables on partition column and have equal "
-					 "filter on joining columns.";
-	char *filterHint = "Consider using equal filter on partition column.";
+	const char *errorHint = NULL;
+	const char *joinHint = "Consider joining tables on partition column and have "
+						   "equal filter on joining columns.";
+	const char *filterHint = "Consider using an equality filter on the distributed "
+							 "table's partition column.";
 
 	if (queryTree->hasSubLinks)
 	{
@@ -468,19 +469,10 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	if (!preconditionsSatisfied)
 	{
 		bool showHint = ErrorHintRequired(errorHint, queryTree);
-		if (showHint)
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("cannot perform distributed planning on this query"),
-							errdetail("%s", errorDetail),
-							errhint("%s", errorHint)));
-		}
-		else
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("cannot perform distributed planning on this query"),
-							errdetail("%s", errorDetail)));
-		}
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot perform distributed planning on this query"),
+						errdetail("%s", errorDetail),
+						showHint ? errhint("%s", errorHint) : 0));
 	}
 }
 
@@ -552,7 +544,7 @@ HasUnsupportedJoinWalker(Node *node, void *context)
  * only has reference table(s), then it is handled by router planner.
  */
 static bool
-ErrorHintRequired(char *errorHint, Query *queryTree)
+ErrorHintRequired(const char *errorHint, Query *queryTree)
 {
 	List *rangeTableList = NIL;
 	ListCell *rangeTableCell = NULL;
