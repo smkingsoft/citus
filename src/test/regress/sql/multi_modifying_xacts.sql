@@ -97,7 +97,7 @@ COMMIT;
 \set VERBOSITY default
 
 
--- should be valid to edit labs after researchers...
+-- it's valid to modify tables with differing shard/replica counts in one xact (big first).
 BEGIN;
 INSERT INTO researchers VALUES (8, 5, 'Douglas Engelbart');
 INSERT INTO labs VALUES (5, 'Los Alamos');
@@ -105,21 +105,19 @@ COMMIT;
 
 SELECT * FROM researchers, labs WHERE labs.id = researchers.lab_id;
 
--- but not the other way around (would require expanding xact participants)...
+-- it's valid to modify tables with differing shard/replica counts in one xact (small first).
 BEGIN;
 INSERT INTO labs VALUES (6, 'Bell Labs');
 INSERT INTO researchers VALUES (9, 6, 'Leslie Lamport');
-COMMIT;
+ROLLBACK;
 
--- this logic even applies to router SELECTs occurring after a modification:
--- selecting from the modified node is fine...
+-- it's ok to select from nodes previously connected to
 BEGIN;
 INSERT INTO labs VALUES (6, 'Bell Labs');
 SELECT count(*) FROM researchers WHERE lab_id = 6;
 ABORT;
 
--- but if a SELECT needs to go to new node, that's a problem...
-
+-- it's also fine if a SELECT has to go to a new node.
 BEGIN;
 
 UPDATE pg_dist_shard_placement AS sp SET shardstate = 3
