@@ -580,6 +580,84 @@ ShardListInsertCommand(List *shardIntervalList)
 
 
 /*
+ * ShardListDeleteCommand generates a singe command that can be
+ * executed to delete shard and shard placement metadata for the
+ * given shard intervals. The function assumes that each shard has a
+ * single placement, and asserts this information.
+ */
+List *
+ShardListDeleteCommand(List *shardIntervalList)
+{
+	List *commandList = NIL;
+	ListCell *shardIntervalCell = NULL;
+	StringInfo deletePlacementCommand = makeStringInfo();
+	StringInfo deleteShardCommand = makeStringInfo();
+	int shardCount = list_length(shardIntervalList);
+	int processedShardCount = 0;
+	int processedShardPlacementCount = 0;
+
+	/* if there are no shards, return empty list */
+	if (shardCount == 0)
+	{
+		return commandList;
+	}
+
+	/* generate the shard placement query without any values yet */
+	appendStringInfo(deletePlacementCommand,
+					 "DELETE FROM pg_dist_shard_placement WHERE ");
+
+	/* add placements to deletePlacementCommand */
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		uint64 shardId = shardInterval->shardId;
+
+		List *shardPlacementList = FinalizedShardPlacementList(shardId);
+		ShardPlacement *placement = NULL;
+
+		/* the function only handles single placement per shard */
+		Assert(list_length(shardPlacementList) == 1);
+
+		placement = (ShardPlacement *) linitial(shardPlacementList);
+		appendStringInfo(deletePlacementCommand, "placementid = %lu",
+						 placement->placementId);
+
+		processedShardPlacementCount++;
+		if (processedShardPlacementCount != shardCount)
+		{
+			appendStringInfo(deletePlacementCommand, " OR ");
+		}
+	}
+
+	/* add the command to the list that we'll return */
+	commandList = lappend(commandList, deletePlacementCommand->data);
+
+	/* now, generate the shard query without any values yet */
+	appendStringInfo(deleteShardCommand, "DELETE FROM pg_dist_shard WHERE ");
+
+	/* now add shards to deleteShardCommand */
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		uint64 shardId = shardInterval->shardId;
+
+		appendStringInfo(deleteShardCommand, "shardid = %lu", shardId);
+
+		processedShardCount++;
+		if (processedShardCount != shardCount)
+		{
+			appendStringInfo(deleteShardCommand, " OR ");
+		}
+	}
+
+	/* finally add the command to the list that we'll return */
+	commandList = lappend(commandList, deleteShardCommand->data);
+
+	return commandList;
+}
+
+
+/*
  * NodeDeleteCommand generate a command that can be
  * executed to delete the metadata for a worker node.
  */

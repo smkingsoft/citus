@@ -432,8 +432,8 @@ CreateNewMetadata(List *newShardIntervalList, List *nodeConnectionInfoList)
 			ListCell *commandCell = NULL;
 
 			/* send the commands one by one */
-			shardMetadataInsertCommandList = ShardListInsertCommand(list_make1(
-																		newShardInterval));
+			shardMetadataInsertCommandList =
+				ShardListInsertCommand(list_make1(newShardInterval));
 			foreach(commandCell, shardMetadataInsertCommandList)
 			{
 				char *command = (char *) lfirst(commandCell);
@@ -454,8 +454,23 @@ DropOldShards(List *shardIntervalList, List *nodeConnectionInfoList)
 		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		ListCell *nodeConnectionInfoCell = NULL;
 		Oid relationId = shardInterval->relationId;
-
 		uint64 oldShardId = shardInterval->shardId;
+
+		if (ShouldSyncTableMetadata(relationId))
+		{
+			List *shardMetadataInsertCommandList = NIL;
+			ListCell *commandCell = NULL;
+
+			/* send the commands one by one */
+			shardMetadataInsertCommandList =
+				ShardListDeleteCommand(list_make1(shardInterval));
+			foreach(commandCell, shardMetadataInsertCommandList)
+			{
+				char *command = (char *) lfirst(commandCell);
+				SendCommandToWorkers(WORKERS_WITH_METADATA, command);
+			}
+		}
+
 		DeleteShardRow(oldShardId);
 
 		foreach(nodeConnectionInfoCell, nodeConnectionInfoList)
