@@ -287,11 +287,12 @@ NewShardIntervalList(ShardInterval *oldShardInterval, int hashedValue)
 				(ShardInterval *) lfirst(baseShardIntervalCell);
 
 			ShardInterval *newShardInterval = CitusMakeNode(ShardInterval);
+			CopyShardInterval(shardInterval, newShardInterval);
+
+			/* set values of the new shard */
 			newShardInterval->minValue = baseShardInterval->minValue;
 			newShardInterval->maxValue = baseShardInterval->maxValue;
-			newShardInterval->relationId = shardInterval->relationId;
 			newShardInterval->shardId = GetNextShardId();
-			newShardInterval->storageType = shardInterval->storageType;
 
 			newShardIntervalList = lappend(newShardIntervalList, newShardInterval);
 		}
