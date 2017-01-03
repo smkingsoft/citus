@@ -239,6 +239,25 @@ CopyShardInterval(ShardInterval *srcInterval, ShardInterval *destInterval)
 }
 
 
+List *
+CopyShardIntervalList(List *srcIntervalList)
+{
+	List *destIntervalList = NIL;
+	ListCell *shardIntervalCell = NULL;
+
+	foreach(shardIntervalCell, srcIntervalList)
+	{
+		ShardInterval *srcShardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		ShardInterval *copyShardInterval = CitusMakeNode(ShardInterval);
+
+		CopyShardInterval(srcShardInterval, copyShardInterval);
+		destIntervalList = lappend(destIntervalList, copyShardInterval);
+	}
+
+	return destIntervalList;
+}
+
+
 /*
  * ShardLength finds shard placements for the given shardId, extracts the length
  * of a finalized shard, and returns the shard's length. This function errors

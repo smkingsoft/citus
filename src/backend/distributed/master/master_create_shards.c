@@ -142,12 +142,15 @@ SplitShardForTenant(ShardInterval *oldShardInterval, char *hashFunctionName,
 	/* XXX: is it safe to use directly hashed value */
 	int isolatedShardIndex = 0;
 	ShardInterval *isolatedShardInterval = NULL;
+	List *cachedColocatedShardIntervalList = NIL;
 	List *colocatedShardIntervalList = NIL;
 	List *newShardIntervalList = NIL;
 	List *newShardCommandList = NIL;
 	List *nodeConnectionInfoList = NIL;
 
-	colocatedShardIntervalList = ColocatedShardIntervalList(oldShardInterval);
+	cachedColocatedShardIntervalList = ColocatedShardIntervalList(oldShardInterval);
+	colocatedShardIntervalList = CopyShardIntervalList(cachedColocatedShardIntervalList);
+
 	newShardIntervalList = NewShardIntervalList(oldShardInterval, hashedValue);
 	newShardCommandList = NewShardCommandList(colocatedShardIntervalList,
 											  newShardIntervalList,
@@ -391,7 +394,10 @@ CreateNewShards(List *nodeConnectionInfoList, List *createNewShardCommandList)
 static void
 CreateNewMetadata(List *newShardIntervalList, List *nodeConnectionInfoList)
 {
+	List *mxShardIntervalList = NIL;
+	List *shardMetadataInsertCommandList = NIL;
 	ListCell *shardIntervalCell = NULL;
+	ListCell *commandCell = NULL;
 
 	/* add new metadata */
 	foreach(shardIntervalCell, newShardIntervalList)
@@ -423,23 +429,24 @@ CreateNewMetadata(List *newShardIntervalList, List *nodeConnectionInfoList)
 									shardSize, workerName, workerPort);
 		}
 
-		CitusInvalidateRelcacheByRelid(relationId);
-		CommandCounterIncrement();
-
 		if (ShouldSyncTableMetadata(relationId))
 		{
-			List *shardMetadataInsertCommandList = NIL;
-			ListCell *commandCell = NULL;
+			ShardInterval *copyShardInterval = CitusMakeNode(ShardInterval);
 
-			/* send the commands one by one */
-			shardMetadataInsertCommandList =
-				ShardListInsertCommand(list_make1(newShardInterval));
-			foreach(commandCell, shardMetadataInsertCommandList)
-			{
-				char *command = (char *) lfirst(commandCell);
-				SendCommandToWorkers(WORKERS_WITH_METADATA, command);
-			}
+			CopyShardInterval(newShardInterval, copyShardInterval);
+			mxShardIntervalList = lappend(mxShardIntervalList, copyShardInterval);
 		}
+
+		CitusInvalidateRelcacheByRelid(relationId);
+		CommandCounterIncrement();
+	}
+
+	/* send the commands one by one */
+	shardMetadataInsertCommandList = ShardListInsertCommand(mxShardIntervalList);
+	foreach(commandCell, shardMetadataInsertCommandList)
+	{
+		char *command = (char *) lfirst(commandCell);
+		SendCommandToWorkers(WORKERS_WITH_METADATA, command);
 	}
 }
 
