@@ -45,12 +45,6 @@ static void RepairShardPlacement(int64 shardId, char *sourceNodeName,
 static void EnsureShardCanBeRepaired(int64 shardId, char *sourceNodeName,
 									 int32 sourceNodePort, char *targetNodeName,
 									 int32 targetNodePort);
-static ShardPlacement * SearchShardPlacementInList(List *shardPlacementList,
-												   char *nodeName, uint32 nodePort,
-												   bool missingOk);
-static List * CopyShardCommandList(ShardInterval *shardInterval, char *sourceNodeName,
-								   int32 sourceNodePort);
-static List * CopyShardForeignConstraintCommandList(ShardInterval *shardInterval);
 static List * RecreateTableDDLCommandList(Oid relationId);
 
 /* declarations for dynamic loading */
